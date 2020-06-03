@@ -145,6 +145,43 @@ function loadKeys () {
   }
 }
 
+function getLocalIP () {
+  let ips = [];
+  let ifaces = require('os').networkInterfaces();
+  Object.keys(ifaces).forEach(ifname => {
+    let alias = 0;
+    ifaces[ifname].forEach(iface => {
+      if ('IPv4' !== iface.family || iface.internal !== false) {
+        return;
+      }
+      if (alias === 0) {
+        ips.push({
+          name: ifname,
+          ip: iface.address,
+          netmask: iface.netmask,
+          iface
+        })
+      }
+      ++alias;
+    });
+  });
+  if (ips.length > 0) {
+    console.log(ips)
+    return (ips.filter(ip => !(/.255$/.test(ip.netmask)))[0] || ips[0]).ip
+  } else {
+    return '127.0.0.1';
+  }
+}
+
+function getLocalId() {
+  let id = getArg('id');
+  if (id === 'true' || id === true) return getLocalIP();
+  if (id) return id;
+  return require('os').hostname();
+}
+
+console.log('v===>',getLocalId());
+
 function loadRootCert (keys) {
   const crtFile = resolveFile('root.crt');
   try {
@@ -161,7 +198,7 @@ function loadRootCert (keys) {
     cert.validity.notAfter.setFullYear(cert.validity.notBefore.getFullYear() + 50);
     var attrs = [{
       name: 'commonName',
-      value: 'Cache Mirror Certificate'
+      value: 'Auto Cache Mirror@' + getLocalId()
     }, {
       shortName: 'OU',
       value: 'Cache'
