@@ -16,9 +16,17 @@ const pki = forge.pki;
 const asn1 = forge.asn1;
 
 function getArg (name, defVal) {
-  let pos = process.argv.indexOf('--' + name);
+  name = '--' + name;
+  let pos = process.argv.indexOf(name);
   if (pos > 0 && pos + 1 < process.argv.length) {
-    return process.argv[pos + 1];
+    let rs = [process.argv[pos + 1]];
+    pos = process.argv.indexOf(name, pos);
+    while(pos > 0 && pos + 1 < process.argv.length) {
+      rs.push(process.argv[pos + 1]);
+      pos = process.argv.indexOf(name, pos);
+    }
+    if (rs.length > 1) return rs;
+    return rs[0];
   }
   return defVal;
 }
@@ -31,6 +39,11 @@ function addr2obj (addr) {
     const [host, port] = addr.split(':');
     return { host, port: port || null };
   }
+}
+
+let nameservers = getArg('dns');
+if (nameservers && nameservers.length > 0) {
+  dns.setServers(nameservers.concat(dns.getServers()));
 }
 
 const CRLF = Buffer.from('\n');
@@ -74,8 +87,8 @@ const lookup = (function () {
   let hostFile = getArg('hosts');
   if (!hostFile) return;
   if (hostFile !== 'false') {
-    fs.watch(hostFile, (_, filename) => {
-      loadHosts(filename);
+    fs.watch(hostFile, () => {
+      loadHosts(hostFile);
     });
     loadHosts(hostFile);
   }
