@@ -1,5 +1,4 @@
+# auto-cache-mirror
 
-添加 根证书
-
-/etc/pki/tls/certs/ca-bundle.crt
+  只需要把对应的域名执行到当前服务，自动缓存所有请求，加速再次访问。用于安装时需要从外部下载资源时。
 

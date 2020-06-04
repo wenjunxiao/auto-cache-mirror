@@ -22,7 +22,7 @@ function getArg (name, defVal) {
     pos += 1;
     let rs = [process.argv[pos]];
     pos = process.argv.indexOf(name, pos);
-    while(pos > 0 && pos + 1 < process.argv.length) {
+    while (pos > 0 && pos + 1 < process.argv.length) {
       pos += 1;
       rs.push(process.argv[pos]);
       pos = process.argv.indexOf(name, pos);
@@ -51,18 +51,18 @@ if (nameservers && nameservers.length > 0) {
 const CRLF = Buffer.from('\n');
 const EMPTY = Buffer.alloc(0);
 const SYS_PROXY = addr2obj(getArg('proxy')) || {};
-const SYS_REDIRECTS = (function () {
-  let redirects = getArg('redirect');
-  if (!redirects) return {};
-  return fs.readFileSync(redirects).toString('utf-8').split('\n').reduce((r, line) => {
+const SYS_REDIRECTS = {};
+const REDIRECT_CONF = getArg('redirect');
+const BASE_DIR = getArg('cache-dir', path.resolve(process.env.HOME || process.env.HOMEPATH || process.env.USERPROFILE, '.cache-mirror'));
+if (REDIRECT_CONF) {
+  fs.readFileSync(REDIRECT_CONF).toString('utf-8').split('\n').reduce((r, line) => {
     let [m, k, v] = line.split(/\s+/);
     if (m && k && v) {
       r[m + ' ' + k] = v;
     }
     return r;
   }, {});
-})();
-const BASE_DIR = getArg('cache-dir', path.resolve(process.env.HOME || process.env.HOMEPATH || process.env.USERPROFILE, '.cache-mirror'));
+}
 let HOSTS = {};
 function loadHosts (filename) {
   fs.readFile(filename, (err, buffer) => {
@@ -1116,11 +1116,20 @@ function manage (client, header, method, url, httpVersion) {
         return client.end(JSON.stringify(SYS_REDIRECTS));
       } else if (method === 'POST' || method === 'PUT') {
         query = qs.parse(query);
-        SYS_REDIRECTS[query.src] = query.dst;
+        if (query.src) {
+          SYS_REDIRECTS[query.src] = query.dst;
+        }
+        if (query.persistence === 'true') {
+          return fs.appendFile(REDIRECT_CONF, Buffer.from('\n' + query.src + ' ' + query.dst), () => {
+            return client.end(JSON.stringify(SYS_REDIRECTS));
+          })
+        }
         return client.end(JSON.stringify(SYS_REDIRECTS));
       } else if (method === 'DELETE') {
         query = qs.parse(query);
-        delete SYS_REDIRECTS[query.src];
+        if (query.src) {
+          delete SYS_REDIRECTS[query.src];
+        }
         return client.end(JSON.stringify(SYS_REDIRECTS));
       }
     }
@@ -1135,6 +1144,7 @@ function manage (client, header, method, url, httpVersion) {
   client.write('为了支持https，需要在客户端安装根证书<br/><code>');
   client.write(`\tLinux: curl http://${client.localAddress}:${client.localPort}/root.crt >> /etc/pki/tls/certs/ca-bundle.crt <br/>`);
   client.write(`\tMacOS: 从 http://${client.localAddress}:${client.localPort}/root.crt 下载之后安装，并信任 <br/>`);
+  client.write(`\tnpm: curl http://${client.localAddress}:${client.localPort}/root.crt >> ~/.extra.crt 并设置环境变量 echo "export NODE_EXTRA_CA_CERTS=$HOME/.extra.csr" >> ~/.bash_profile <br/>`);
   client.write(`</code>`);
   client.write('当前缓存目录: ' + BASE_DIR + '<br/>');
   client.end();
