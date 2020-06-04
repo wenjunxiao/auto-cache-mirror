@@ -1143,7 +1143,7 @@ function manage (client, header, method, url, httpVersion) {
   client.write('为了支持https，需要在客户端安装根证书<br/><code>');
   client.write(`\tLinux: curl http://${client.localAddress}:${client.localPort}/root.crt >> /etc/pki/tls/certs/ca-bundle.crt <br/>`);
   client.write(`\tMacOS: 从 http://${client.localAddress}:${client.localPort}/root.crt 下载之后安装，并信任 <br/>`);
-  client.write(`\tnpm: curl http://${client.localAddress}:${client.localPort}/root.crt >> ~/.extra.crt 并设置环境变量 echo "export NODE_EXTRA_CA_CERTS=$HOME/.extra.csr" >> ~/.bash_profile <br/>`);
+  client.write(`\tnpm: curl http://${client.localAddress}:${client.localPort}/root.crt >> ~/.extra.crt 并设置环境变量 echo "export NODE_EXTRA_CA_CERTS=$HOME/.extra.crt" >> ~/.bash_profile <br/>`);
   client.write(`</code>`);
   client.write('当前缓存目录: ' + BASE_DIR + '<br/>');
   client.end();
