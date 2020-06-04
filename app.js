@@ -6,6 +6,7 @@ const dns = require('dns');
 const forge = require('node-forge');
 const crypto = require('crypto');
 const zlib = require("zlib");
+const qs = require('querystring');
 const urlParse = require('url').parse;
 const {
   spawn,
@@ -32,9 +33,20 @@ function addr2obj (addr) {
   }
 }
 
-const CRLF = Buffer.from('\r\n');
+const CRLF = Buffer.from('\n');
 const EMPTY = Buffer.alloc(0);
-const PROXY = addr2obj(getArg('proxy'))
+const SYS_PROXY = addr2obj(getArg('proxy')) || {};
+const SYS_REDIRECTS = (function () {
+  let redirects = getArg('redirect');
+  if (!redirects) return {};
+  return fs.readFileSync(redirects).toString('utf-8').split('\n').reduce((r, line) => {
+    let [m, k, v] = line.split(/\s+/);
+    if (m && k && v) {
+      r[m + ' ' + k] = v;
+    }
+    return r;
+  }, {});
+})();
 const BASE_DIR = getArg('cache-dir', path.resolve(process.env.HOME || process.env.HOMEPATH || process.env.USERPROFILE, '.cache-mirror'));
 let HOSTS = {};
 function loadHosts (filename) {
@@ -104,7 +116,12 @@ function md5 (buf) {
 }
 
 function resolveFile (...args) {
-  return path.resolve(BASE_DIR, ...args);
+  try {
+    return path.resolve(BASE_DIR, ...args);
+  } catch (err) {
+    console.log('resolve file error =>', args);
+    throw err;
+  }
 }
 
 const readFile = filename => {
@@ -166,21 +183,18 @@ function getLocalIP () {
     });
   });
   if (ips.length > 0) {
-    console.log(ips)
     return (ips.filter(ip => !(/.255$/.test(ip.netmask)))[0] || ips[0]).ip
   } else {
     return '127.0.0.1';
   }
 }
 
-function getLocalId() {
+function getLocalId () {
   let id = getArg('id');
   if (id === 'true' || id === true) return getLocalIP();
   if (id) return id;
   return require('os').hostname();
 }
-
-console.log('v===>',getLocalId());
 
 function loadRootCert (keys) {
   const crtFile = resolveFile('root.crt');
@@ -313,6 +327,7 @@ function issuerCert (privateKey, publicKey, cert1, altNames, subject, extensions
 
 const handler = socket => {
   const port = socket.localPort;
+  socket.reqId = 'REQ' + Date.now();
   socket.once('readable', chunk => {
     chunk = socket.read() || EMPTY;
     if (chunk[0] === 0x16) { // the type of tls message
@@ -396,6 +411,7 @@ const handler = socket => {
           key: privatePem,
           cert: certPem
         });
+        cls.reqId = socket.reqId;
         return new Promise((resolve) => {
           cls.once('readable', () => {
             let host, method, url, httpVersion;
@@ -418,7 +434,7 @@ const handler = socket => {
                 method = RegExp.$1;
                 url = RegExp.$2;
                 httpVersion = RegExp.$3;
-                chunks.push(header.slice(pos, p + 2));
+                chunks.push(header.slice(pos, p + CRLF.length));
               } else if (!host && /^(Host:\s*)(.*)(\s*)$/.test(s)) {
                 let prefix = RegExp.$1;
                 let suffix = RegExp.$3;
@@ -431,15 +447,15 @@ const handler = socket => {
                   host = RegExp.$1;
                   chunks.push(Buffer.from(prefix + host + suffix, 'utf-8'));
                 } else {
-                  chunks.push(header.slice(pos, p + 2));
+                  chunks.push(header.slice(pos, p + CRLF.length));
                 }
               } else {
-                chunks.push(header.slice(pos, p + 2));
+                chunks.push(header.slice(pos, p + CRLF.length));
               }
-              pos = p + 2;
+              pos = p + CRLF.length;
             } while (!(host && url));
             if (!url) {
-              console.log('no url =>', header.toString('utf-8'));
+              console.log('[%s] no url =>', cls.reqId, header.toString('utf-8'));
               return cls.end();
             }
             let { pathname, query } = urlParse(url);
@@ -456,53 +472,60 @@ const handler = socket => {
             const filename = resolveFile(host, port.toString(), pathname.replace(/^\/*/, ''), md5(header));
             fs.stat(filename, (_, stat) => {
               if (stat && stat.size > 0) {
-                console.log('cache =>', method, host, url, filename);
+                console.log('[%s] cache =>', cls.reqId, method, host, port, url, filename);
                 fs.createReadStream(filename).pipe(cls);
                 return resolve([true, cls, header]);
               };
               return resolve([false, cls, header]);
             });
-            // const stream = fs.createReadStream(filename);
-            // stream.once('error', () => {
-            //   return resolve([false, cls, header]);
-            // }).once('end', () => {
-            //   console.log('cache =>', method, host, url, filename);
-            //   return resolve([true, cls, header]);
-            // }).pipe(cls);
           });
         });
       }).then(([cached, cls, header]) => {
         if (cached) return;
         const options = { rejectUnauthorized: false, servername: hostname, lookup };
-        const sls = tls.connect(port, hostname, options, () => {
-          if (!cls) {
-            const csr = sls.getPeerCertificate(true);
-            const cert1 = pki.certificateFromAsn1(asn1.fromDer(csr.raw.toString('binary')));
-            const certPem = issuerCert(privateKey, publicKey, cert1);
-            ensureDir(path.dirname(certFile)).then(() => {
-              fs.writeFile(certFile, certPem, () => {
-                console.log('cache cert =>', certFile);
-              });
-            });
-            cls = new tls.TLSSocket(socket, {
-              isServer: true,
-              key: privatePem,
-              cert: certPem
-            });
-            cls.once('readable', () => {
-              cachePipe(cls, sls, port, EMPTY, isLocal ? (host) => {
-                if (/^(.*)\.local$/.test(host)) {
-                  return RegExp.$1;
+        if (SYS_PROXY.host) {
+          const proxyOpts = {
+            rejectUnauthorized: false,
+            host: SYS_PROXY.host,
+            port: SYS_PROXY.port
+          };
+          console.log('[%s] connect proxy => %s:%s', socket.reqId, SYS_PROXY.host, SYS_PROXY.port);
+          const proxy = net.connect(proxyOpts, () => {
+            console.log('[%s] proxy connected => %s:%s', socket.reqId, hostname, port);
+            proxy.write(`CONNECT ${hostname}:${port} HTTP/1.1\r\n\r\n`);
+          });
+          return proxy.once('readable', () => {
+            console.log('[%s] proxy readable => %s:%s', socket.reqId, hostname, port);
+            let tmp = EMPTY;
+            let pos = 0;
+            do {
+              let p = tmp.indexOf(CRLF, pos);
+              if (p < 0) {
+                let chunk = proxy.read();
+                if (chunk) {
+                  tmp = Buffer.concat([tmp, chunk]);
+                  continue;
+                } else {
+                  break;
                 }
-                return host;
-              } : null);
-            });
-          } else {
-            cachePipe(cls, sls, port, header, null);
-          }
-        });
+              }
+              let s = tmp.toString('utf-8', pos, p);
+              pos = p + CRLF.length;
+              if (/^HTTP\/\S+\s+(\d+)/.test(s) && /Connection established/i.test(s) && tmp.indexOf(CRLF, pos) === pos) {
+                console.log('[%s] proxy status =>', socket.reqId, s);
+                tmp = tmp.slice(p + 4);
+                break;
+              }
+            } while (pos < tmp.length);
+            options.socket = proxy;
+            connectTLS(socket, options, cls, header, certFile, isLocal, port);
+          });
+        }
+        options.host = hostname;
+        options.port = port;
+        connectTLS(socket, options, cls, header, certFile, isLocal, port);
       }).catch(err => {
-        console.log('error =>', err);
+        console.log('[%s] error =>', socket.reqId, err);
       });
     } else { // http
       cachePipe(socket, null, port, chunk, null);
@@ -510,9 +533,40 @@ const handler = socket => {
   });
 };
 
+function connectTLS (socket, options, cls, header, certFile, isLocal, port) {
+  const sls = tls.connect(options, () => {
+    if (!cls) {
+      const csr = sls.getPeerCertificate(true);
+      const cert1 = pki.certificateFromAsn1(asn1.fromDer(csr.raw.toString('binary')));
+      const certPem = issuerCert(privateKey, publicKey, cert1);
+      ensureDir(path.dirname(certFile)).then(() => {
+        fs.writeFile(certFile, certPem, () => {
+          console.log('[%s] cached cert =>', socket.reqId, certFile);
+        });
+      });
+      cls = new tls.TLSSocket(socket, {
+        isServer: true,
+        key: privatePem,
+        cert: certPem
+      });
+      cls.reqId = socket.reqId;
+      cls.once('readable', () => {
+        cachePipe(cls, sls, port, EMPTY, isLocal ? (host) => {
+          if (/^(.*)\.local$/.test(host)) {
+            return RegExp.$1;
+          }
+          return host;
+        } : null);
+      });
+    } else {
+      cachePipe(cls, sls, port, header, null);
+    }
+  });
+}
+
 function checkGit (host, port, pathname, header, pos, client, query, method, httpVersion, url) {
   if (/^\/[^/]+\/[^/]+\/(HEAD|info\/refs|objects\/info\/.*|git-(upload|receive)-pack)$/.test(pathname)) {
-    console.log('git =>', method, host, url, resolveFile(host));
+    console.log('[%s] git =>', client.reqId, method, host, url, resolveFile(host));
     pathname = pathname.replace(/^(?:\/[^\/]+){2}/, $0 => {
       if (/.git$/.test($0)) {
         return $0;
@@ -533,14 +587,14 @@ function checkGit (host, port, pathname, header, pos, client, query, method, htt
         }
       }
       if (p === pos) {
-        pos = p + 2;
+        pos = p + CRLF.length;
         break;
       }
       let s = header.toString('utf-8', pos, p);
       if (/^([^:]+):\s*(.*)(\s*)/i.test(s)) {
         headers[RegExp.$1.toLowerCase()] = RegExp.$2;
       }
-      pos = p + 2;
+      pos = p + CRLF.length;
     } while (pos < header.length);
     chunks.push(header.slice(pos));
     let chunk = client.read();
@@ -567,14 +621,14 @@ function checkGit (host, port, pathname, header, pos, client, query, method, htt
     return statAsync(repoHead).then(stat => {
       if (!(stat && stat.size > 0)) {
         const baseUrl = (client instanceof tls.TLSSocket ? 'https' : 'http') + '://' + host + ':' + port;
-        return gitClone(env.GIT_PROJECT_ROOT, pathname, baseUrl);
+        return gitClone(env.GIT_PROJECT_ROOT, pathname, baseUrl, client);
       }
     }).then(() => {
       return pipeGit(pathname, env, client, body, httpVersion);
     }).then(() => {
       client.end();
     }).catch(err => {
-      console.error('git error =>', err);
+      console.error('[%s] git error =>', client.reqId, err);
       client.end();
     });
   }
@@ -608,10 +662,10 @@ function cachePipe (client, server, port, header, mapper) {
       method = RegExp.$1;
       url = RegExp.$2;
       httpVersion = RegExp.$3;
-      chunks.push(header.slice(pos, p + 2));
+      chunks.push(header.slice(pos, p + CRLF.length));
     } else if (!userAgent && /^(User-Agent:\s*)(.*)(\s*)$/.test(s)) {
       userAgent = RegExp.$2;
-      chunks.push(header.slice(pos, p + 2));
+      chunks.push(header.slice(pos, p + CRLF.length));
     } else if (!host && /^(Host:\s*)(.*)(\s*)$/.test(s)) {
       let prefix = RegExp.$1;
       let suffix = RegExp.$3;
@@ -624,12 +678,12 @@ function cachePipe (client, server, port, header, mapper) {
         host = mapper(host);
         chunks.push(Buffer.from(prefix + host + suffix, 'utf-8'));
       } else {
-        chunks.push(header.slice(pos, p + 2));
+        chunks.push(header.slice(pos, p + CRLF.length));
       }
     } else {
-      chunks.push(header.slice(pos, p + 2));
+      chunks.push(header.slice(pos, p + CRLF.length));
     }
-    pos = p + 2;
+    pos = p + CRLF.length;
   } while (!(host && url && userAgent));
   chunks.push(header.slice(pos));
   let chunk = client.read();
@@ -637,8 +691,8 @@ function cachePipe (client, server, port, header, mapper) {
     chunks.push(chunk);
     chunk = client.read();
   }
-  if (!url) {
-    console.log('no url =>', header.toString('utf-8'));
+  if (!url || !host) {
+    console.log('[%s] invalid request =>', client.reqId, header.toString('utf-8'));
     client.end();
     return;
   }
@@ -652,16 +706,31 @@ function cachePipe (client, server, port, header, mapper) {
   const filename = resolveFile(host, port.toString(), pathname.replace(/^\/*/, ''), md5(Buffer.concat(chunks)));
   fs.stat(filename, (_, stat) => {
     if (stat && stat.size > 0) {
-      console.log('cache =>', method, host, url, filename);
+      console.log('[%s] cache =>', client.reqId, method, host, port, url, filename);
       return fs.createReadStream(filename).pipe(client)
     };
-    console.log('request =>', method, host, url, filename);
-    let tmpfile = filename + '.' + Date.now();
+    console.log('[%s] request =>', client.reqId, method, host, port, url, filename);
+    let tmpfile = filename + '.' + client.reqId;
     Promise.all([
       createWriteStream(tmpfile),
       createWriteStream(filename + '.REQ')
     ]).then(([stream, req]) => {
-      if (server) {
+      let key = method + ' ' + host + ':' + port + pathname;
+      let location = SYS_REDIRECTS[key];
+      if (location) {
+        console.log('[%s] system redirect =>', client.reqId, location);
+        connectLocation(location, httpVersion, userAgent, client).then(server => {
+          pipeServer(client, server, stream, method, host, url);
+        }).catch(err => {
+          console.log('[%s] redirect error =>', client.reqId, err);
+          client.end();
+          stream.close();
+        });
+        if (server) {
+          server.end();
+          server = null;
+        }
+      } else if (server) {
         server.write(Buffer.concat(chunks));
       } else {
         const options = { port, host, lookup };
@@ -671,37 +740,50 @@ function cachePipe (client, server, port, header, mapper) {
       }
       client.once('cache-complete', () => {
         fs.rename(tmpfile, filename, () => {
-          console.log('cached =>', filename);
+          console.log('[%s] cached =>', client.reqId, filename);
         });
       });
       req.write(header);
       client.on('end', () => {
+        client.ended = true;
+        client.write = () => { };
+        console.log('[%s] client end.', client.reqId);
         req.close();
       });
-      client.on('data', buf => {
-        req.write(buf);
-        server.write(buf);
+      client.on('error', (err) => {
+        console.log('[%s] client error =>', client.reqId, err);
       });
-      pipeServer(client, server, stream, method, host, url, httpVersion, userAgent);
+      if (server) {
+        client.on('data', buf => {
+          req.write(buf);
+          server.write(buf);
+        });
+        pipeServer(client, server, stream, method, host, url, httpVersion, userAgent);
+      } else {
+        client.on('data', buf => {
+          req.write(buf);
+        });
+      }
     }).catch(err => {
-      console.error('cache request error =>', method, host, url, err);
+      console.error('[%s] cache request error =>', client.reqId, method, host, url, err);
       client.end();
     });
   });
 }
 
 function pipeServer (client, server, stream, method, host, url, httpVersion, userAgent) {
-  console.log('pipe from server => %j %s:%s', server.address(), server.remoteAddress, server.remotePort);
+  console.log('[%s] pipe from server => %j %s:%s', client.reqId, server.localPort, server.remoteAddress, server.remotePort);
+  server.reqId = server.localPort;
   let checked = false, location; // 检查HTTP状态
   server.on('error', (err) => {
-    console.log('server error =>', err);
+    console.log('[%s] server error =>', client.reqId, err);
     if (!location) {
       client.end();
       stream.close();
     }
   });
   server.on('end', () => {
-    console.log('server end.');
+    console.log('[%s][%s] server end(%s).', client.reqId, server.reqId, !!location);
     if (!location) {
       client.end();
       if (checked) {
@@ -722,16 +804,16 @@ function pipeServer (client, server, stream, method, host, url, httpVersion, use
         let p = tmp.indexOf(CRLF, pos);
         if (p > 0) {
           let s = tmp.toString('utf-8', pos, p);
-          pos = p + 2;
+          pos = p + CRLF.length;
           if (status === 301 || status === 302) {
-            if (/^\s*location:\s*(.*)$/i.test(s)) {
+            if (/^\s*location:\s*(.*)\s*$/i.test(s)) {
               location = RegExp.$1;
               server.end();
-              console.log('redirect url =>', location);
-              connectLocation(location, httpVersion, userAgent).then(server => {
+              console.log('[%s] redirect url =>', client.reqId, location);
+              connectLocation(location, httpVersion, userAgent, client).then(server => {
                 pipeServer(client, server, stream, method, host, url);
               }).catch(err => {
-                console.log('redirect error =>', err);
+                console.log('[%s] redirect error =>', client.reqId, err);
                 client.end();
                 stream.close();
               });
@@ -739,17 +821,7 @@ function pipeServer (client, server, stream, method, host, url, httpVersion, use
           }
           if (/^HTTP\/\S+\s+(\d+)/.test(s)) {
             status = parseInt(RegExp.$1, 10);
-            // if (server.proxied && !proxied) {
-            //   console.log('proxy status =>', status, s);
-            //   if (/Connection established/i.test(s) && tmp.indexOf(CRLF, pos) === pos) {
-            //     proxied = true;
-            //     tmp = tmp.slice(pos + 2);
-            //   }
-            //   status = 0;
-            //   pos = 0;
-            //   continue;
-            // }
-            console.log('server status =>', status);
+            console.log('[%s][%s] server status =>', client.reqId, server.reqId, status);
             if (status === 301 || status === 302) {
               continue;
             }
@@ -765,7 +837,7 @@ function pipeServer (client, server, stream, method, host, url, httpVersion, use
   });
 }
 
-function connectLocation (location, httpVersion, agent) {
+function connectLocation (location, httpVersion, agent, client) {
   let locUrl = urlParse(location);
   if (/^https/.test(locUrl.protocol)) {
     locUrl.port = locUrl.port || 443;
@@ -778,10 +850,10 @@ function connectLocation (location, httpVersion, agent) {
     lookup
   };
   let protocol = locUrl.protocol;
-  if (PROXY) {
-    options.host = PROXY.host;
-    options.port = PROXY.port;
-    protocol = PROXY.protocol;
+  if (SYS_PROXY.host) {
+    options.host = SYS_PROXY.host;
+    options.port = SYS_PROXY.port;
+    protocol = SYS_PROXY.protocol;
   }
   return new Promise((resolve, reject) => {
     const writeReq = server => {
@@ -793,11 +865,12 @@ function connectLocation (location, httpVersion, agent) {
         '\r\n'
       ];
       const data = reqData.join('\r\n');
-      if (!PROXY) {
+      if (!SYS_PROXY.host) {
         server.write(Buffer.from(data, 'utf-8'));
         return resolve(server);
       }
       server.once('readable', () => {
+        console.log('[%s] location proxy readable.', client.reqId);
         let tmp = EMPTY;
         let pos = 0;
         do {
@@ -805,7 +878,6 @@ function connectLocation (location, httpVersion, agent) {
           if (p < 0) {
             let chunk = server.read();
             if (chunk) {
-              console.log('chunk ==>', chunk.toString('utf-8'));
               tmp = Buffer.concat([tmp, chunk]);
               continue;
             } else {
@@ -813,9 +885,9 @@ function connectLocation (location, httpVersion, agent) {
             }
           }
           let s = tmp.toString('utf-8', pos, p);
-          pos = p + 2;
+          pos = p + CRLF.length;
           if (/^HTTP\/\S+\s+(\d+)/.test(s) && /Connection established/i.test(s) && tmp.indexOf(CRLF, pos) === pos) {
-            console.log('proxy status =>', s);
+            console.log('[%s] location proxy status =>', client.reqId, s);
             tmp = tmp.slice(p + 4);
             break;
           }
@@ -838,6 +910,7 @@ function connectLocation (location, httpVersion, agent) {
     if (/^https/.test(protocol)) {
       options.port = options.port || 443;
       options.rejectUnauthorized = false;
+      console.log('[%s] connect location => %j', client.reqId, options);
       const server = tls.connect(options, () => {
         writeReq(server);
       });
@@ -845,7 +918,9 @@ function connectLocation (location, httpVersion, agent) {
       return server;
     }
     options.port = options.port || 80;
+    console.log('[%s] connect location => %j', client.reqId, options);
     const server = net.connect(options, () => {
+      console.log('[%s] location connected => %j', client.reqId, options);
       writeReq(server);
     });
     server.once('error', reject);
@@ -853,7 +928,7 @@ function connectLocation (location, httpVersion, agent) {
   });
 }
 
-function gitClone (root, pathname, baseUrl) {
+function gitClone (root, pathname, baseUrl, client) {
   const env = {
     GIT_BIN,
     GIT_ROOT: root,
@@ -866,7 +941,7 @@ function gitClone (root, pathname, baseUrl) {
   const p = spawn(path.resolve(__dirname, 'git-clone.sh'), {
     env
   });
-  console.log('spawn =>', pathname, p.pid);
+  console.log('[%s] spawn =>', client.reqId, pathname, p.pid);
   p.stdout.on('data', buf => {
     process.stdout.write(buf);
   });
@@ -907,11 +982,11 @@ function pipeGit (pathname, env, cls, body, httpVersion) {
       p.emit('git-done', new Error(buf.toString('utf-8')))
     });
     p.on('error', err => {
-      console.error('git error =>', err);
+      console.error('[%s] git error =>', client.reqId, err);
       p.emit('git-done', err);
     });
     p.on('close', (code) => {
-      console.log('git done =>', pathname, code);
+      console.log('[%s] git done =>', client.reqId, pathname, code);
       if (code === 0) {
         p.emit('git-done');
       } else {
@@ -947,13 +1022,28 @@ function manage (client, header, method, url, httpVersion) {
     client.write('\r\n');
     client.end(pem);
     return;
+  } else if (pathname === '/api/proxy') {
+    client.write(`${httpVersion} 200 OK\r\n`);
+    client.write('Server: AutoCacheMirror\r\n');
+    client.write('Content-Type: application/json\r\n');
+    client.write('\r\n');
+    if (method === 'GET') {
+      return client.end(JSON.stringify(SYS_PROXY));
+    } else if (method === 'POST') {
+      query = qs.parse(query);
+      let p = addr2obj(query.addr) || {};
+      SYS_PROXY.protocol = p.protocol;
+      SYS_PROXY.host = p.host;
+      SYS_PROXY.port = p.port;
+      return client.end(JSON.stringify(SYS_PROXY));
+    }
   }
   client.write(`${httpVersion} 200 OK\r\n`);
   client.write('Content-Type: text/html;charset=utf-8\r\n');
   client.write('\r\n');
   client.write('自动缓存镜像服务，只需要把域名绑定到地址: ' + client.localAddress + '，即可自动缓存所有请求的资源，加速再次访问<br/>');
-  if (PROXY) {
-    client.write('当前使用代理服务: ' + PROXY.protocol + '://' + PROXY.host + ':' + PROXY.port + '<br/>');
+  if (SYS_PROXY.host) {
+    client.write('当前使用代理服务: ' + SYS_PROXY.protocol + '://' + SYS_PROXY.host + ':' + SYS_PROXY.port + '<br/>');
   }
   client.write('为了支持https，需要在客户端安装根证书<br/><code>');
   client.write(`\tLinux: curl http://${client.localAddress}:${client.localPort}/root.crt >> /etc/pki/tls/certs/ca-bundle.crt <br/>`);
