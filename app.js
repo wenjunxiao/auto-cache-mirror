@@ -450,7 +450,7 @@ const handler = socket => {
                 url = RegExp.$2;
                 httpVersion = RegExp.$3;
                 chunks.push(header.slice(pos, p + CRLF.length));
-              } else if (!host && /^(Host:\s*)(.*)(\s*)$/.test(s)) {
+              } else if (!host && /^(Host:\s*)(.*)(\s*)$/i.test(s)) {
                 let prefix = RegExp.$1;
                 let suffix = RegExp.$3;
                 host = RegExp.$2;
@@ -458,7 +458,7 @@ const handler = socket => {
                   host = RegExp.$1;
                   port = parseInt(RegExp.$2, 10) || port;
                 }
-                if (isLocal && /^(.*)\.local$/.test(host)) {
+                if (isLocal && /^(.*)\.local$/i.test(host)) {
                   host = RegExp.$1;
                   chunks.push(Buffer.from(prefix + host + suffix, 'utf-8'));
                 } else {
@@ -526,7 +526,7 @@ const handler = socket => {
               }
               let s = tmp.toString('utf-8', pos, p);
               pos = p + CRLF.length;
-              if (/^HTTP\/\S+\s+(\d+)/.test(s) && /Connection established/i.test(s) && checkBodyStart(tmp, pos)) {
+              if (/^HTTP\/\S+\s+(\d+)/i.test(s) && /Connection established/i.test(s) && checkBodyStart(tmp, pos)) {
                 console.log('[%s] proxy status =>', socket.reqId, s);
                 tmp = tmp.slice(p + 4);
                 break;
@@ -567,7 +567,7 @@ function connectTLS (socket, options, cls, header, certFile, isLocal, port) {
       cls.reqId = socket.reqId;
       cls.once('readable', () => {
         cachePipe(cls, sls, port, EMPTY, isLocal ? (host) => {
-          if (/^(.*)\.local$/.test(host)) {
+          if (/^(.*)\.local$/i.test(host)) {
             return RegExp.$1;
           }
           return host;
@@ -678,10 +678,10 @@ function cachePipe (client, server, port, header, mapper) {
       url = RegExp.$2;
       httpVersion = RegExp.$3;
       chunks.push(header.slice(pos, p + CRLF.length));
-    } else if (!userAgent && /^(User-Agent:\s*)(.*)(\s*)$/.test(s)) {
+    } else if (!userAgent && /^(\s*User-Agent:\s*)(.*)(\s*)$/i.test(s)) {
       userAgent = RegExp.$2;
       chunks.push(header.slice(pos, p + CRLF.length));
-    } else if (!host && /^(Host:\s*)(.*)(\s*)$/.test(s)) {
+    } else if (!host && /^(\s*Host:\s*)(.*)(\s*)$/i.test(s)) {
       let prefix = RegExp.$1;
       let suffix = RegExp.$3;
       host = RegExp.$2;
@@ -891,7 +891,7 @@ function pipeServer (client, server, stream, method, host, url, httpVersion, use
               });
             }
           }
-          if (/^HTTP\/\S+\s+(\d+)/.test(s)) {
+          if (/^HTTP\/\S+\s+(\d+)/i.test(s)) {
             status = parseInt(RegExp.$1, 10);
             console.log('[%s][%s] server status =>', client.reqId, server.reqId, status);
             if (status === 301 || status === 302) {
@@ -959,7 +959,7 @@ function connectLocation (location, httpVersion, agent, client) {
           }
           let s = tmp.toString('utf-8', pos, p);
           pos = p + CRLF.length;
-          if (/^HTTP\/\S+\s+(\d+)/.test(s) && /Connection established/i.test(s) && checkBodyStart(tmp, pos)) {
+          if (/^HTTP\/\S+\s+(\d+)/i.test(s) && /Connection established/i.test(s) && checkBodyStart(tmp, pos)) {
             console.log('[%s] location proxy status =>', client.reqId, s);
             tmp = tmp.slice(p + 4);
             break;
