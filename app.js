@@ -55,13 +55,12 @@ const SYS_REDIRECTS = {};
 const REDIRECT_CONF = getArg('redirect');
 const BASE_DIR = getArg('cache-dir', path.resolve(process.env.HOME || process.env.HOMEPATH || process.env.USERPROFILE, '.cache-mirror'));
 if (REDIRECT_CONF) {
-  fs.readFileSync(REDIRECT_CONF).toString('utf-8').split('\n').reduce((r, line) => {
+  fs.readFileSync(REDIRECT_CONF).toString('utf-8').split('\n').forEach(line => {
     let [m, k, v] = line.split(/\s+/);
     if (m && k && v) {
-      r[m + ' ' + k] = v;
+      SYS_REDIRECTS[m + ' ' + k] = v;
     }
-    return r;
-  }, {});
+  });
 }
 let HOSTS = {};
 function loadHosts (filename) {
