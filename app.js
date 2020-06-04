@@ -469,8 +469,8 @@ const handler = socket => {
               }
               pos = p + CRLF.length;
             } while (!(host && url));
-            if (!url) {
-              console.log('[%s] no url =>', cls.reqId, header.toString('utf-8'));
+            if (!url || !host) {
+              console.log('[%s] invalid request =>', cls.reqId, header.toString('utf-8'));
               return cls.end();
             }
             let { pathname, query } = urlParse(url);
