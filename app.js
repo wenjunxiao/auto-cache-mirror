@@ -19,10 +19,12 @@ function getArg (name, defVal) {
   name = '--' + name;
   let pos = process.argv.indexOf(name);
   if (pos > 0 && pos + 1 < process.argv.length) {
-    let rs = [process.argv[pos + 1]];
+    pos += 1;
+    let rs = [process.argv[pos]];
     pos = process.argv.indexOf(name, pos);
     while(pos > 0 && pos + 1 < process.argv.length) {
-      rs.push(process.argv[pos + 1]);
+      pos += 1;
+      rs.push(process.argv[pos]);
       pos = process.argv.indexOf(name, pos);
     }
     if (rs.length > 1) return rs;
