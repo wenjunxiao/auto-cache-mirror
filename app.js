@@ -511,7 +511,7 @@ const handler = socket => {
               }
               let s = tmp.toString('utf-8', pos, p);
               pos = p + CRLF.length;
-              if (/^HTTP\/\S+\s+(\d+)/.test(s) && /Connection established/i.test(s) && tmp.indexOf(CRLF, pos) === pos) {
+              if (/^HTTP\/\S+\s+(\d+)/.test(s) && /Connection established/i.test(s) && checkBodyStart(tmp, pos)) {
                 console.log('[%s] proxy status =>', socket.reqId, s);
                 tmp = tmp.slice(p + 4);
                 break;
@@ -752,6 +752,7 @@ function cachePipe (client, server, port, header, mapper) {
       });
       client.on('error', (err) => {
         console.log('[%s] client error =>', client.reqId, err);
+        client.write = () => { };
       });
       if (server) {
         client.on('data', buf => {
@@ -769,6 +770,23 @@ function cachePipe (client, server, port, header, mapper) {
       client.end();
     });
   });
+}
+
+function checkBodyStart (buf, pos) {
+  if (buf[pos] === 0x0d && buf[pos + 1] === 0x0a) {
+    return 2;
+  } else if (buf[pos] === 0x0a) {
+    return 1;
+  }
+  return 0;
+}
+
+function printProgress (id, progress) {
+  if (process.stdout.clearLine) {
+    process.stdout.clearLine();
+    process.stdout.cursorTo(0);
+    process.stdout.write(id + progress);
+  }
 }
 
 function pipeServer (client, server, stream, method, host, url, httpVersion, userAgent) {
@@ -794,10 +812,49 @@ function pipeServer (client, server, stream, method, host, url, httpVersion, use
   });
   let tmp = EMPTY;
   let pos = 0, status;
+  let contentStart = false;
+  let contentLength = -1;
+  let receiveLength = 0;
+  let rsp = EMPTY;
+  let rpos = 0;
+  const title = `[${client.reqId}][${server.reqId}] received => `;
+  const checkReceived = buf => {
+    if (contentStart) {
+      receiveLength += buf.length;
+      printProgress(title, receiveLength + '/' + contentLength);
+      if (contentLength === receiveLength) {
+        process.stdout.write('\n');
+        console.log('[%s][%s] content complete =>', client.reqId, server.reqId, receiveLength);
+        server.end();
+      }
+    } else {
+      rsp = Buffer.concat([rsp, buf]);
+      do {
+        let p = rsp.indexOf(CRLF, rpos);
+        if (p > 0) {
+          let s = rsp.toString('utf-8', rpos, p);
+          rpos = p + CRLF.length;
+          let started = checkBodyStart(rsp, rpos);
+          // console.log('receiveLength =>', started);
+          if (started > 0) {
+            contentStart = true;
+            receiveLength = rsp.length - rpos - started;
+            break;
+          }
+          if (/^\s*Content-Length:\s*(\d+)\s*$/i.test(s)) {
+            contentLength = parseInt(RegExp.$1);
+          }
+        } else {
+          break;
+        }
+      } while (!contentStart);
+    }
+  };
   server.on('data', buf => {
     if (checked) {
       stream.write(buf);
       client.write(buf);
+      checkReceived(buf);
     } else {
       tmp = Buffer.concat([tmp, buf]);
       do {
@@ -828,6 +885,7 @@ function pipeServer (client, server, stream, method, host, url, httpVersion, use
             checked = true;
             stream.write(tmp);
             client.write(tmp);
+            checkReceived(tmp);
           }
         } else {
           break;
@@ -886,7 +944,7 @@ function connectLocation (location, httpVersion, agent, client) {
           }
           let s = tmp.toString('utf-8', pos, p);
           pos = p + CRLF.length;
-          if (/^HTTP\/\S+\s+(\d+)/.test(s) && /Connection established/i.test(s) && tmp.indexOf(CRLF, pos) === pos) {
+          if (/^HTTP\/\S+\s+(\d+)/.test(s) && /Connection established/i.test(s) && checkBodyStart(tmp, pos)) {
             console.log('[%s] location proxy status =>', client.reqId, s);
             tmp = tmp.slice(p + 4);
             break;
@@ -1022,20 +1080,34 @@ function manage (client, header, method, url, httpVersion) {
     client.write('\r\n');
     client.end(pem);
     return;
-  } else if (pathname === '/api/proxy') {
+  } else if (pathname.startsWith('/api/')) {
     client.write(`${httpVersion} 200 OK\r\n`);
     client.write('Server: AutoCacheMirror\r\n');
     client.write('Content-Type: application/json\r\n');
     client.write('\r\n');
-    if (method === 'GET') {
-      return client.end(JSON.stringify(SYS_PROXY));
-    } else if (method === 'POST') {
-      query = qs.parse(query);
-      let p = addr2obj(query.addr) || {};
-      SYS_PROXY.protocol = p.protocol;
-      SYS_PROXY.host = p.host;
-      SYS_PROXY.port = p.port;
-      return client.end(JSON.stringify(SYS_PROXY));
+    if (pathname === '/api/proxy') {
+      if (method === 'GET') {
+        return client.end(JSON.stringify(SYS_PROXY));
+      } else if (method === 'POST') {
+        query = qs.parse(query);
+        let p = addr2obj(query.addr) || {};
+        SYS_PROXY.protocol = p.protocol;
+        SYS_PROXY.host = p.host;
+        SYS_PROXY.port = p.port;
+        return client.end(JSON.stringify(SYS_PROXY));
+      }
+    } else if (pathname === '/api/redirect') {
+      if (method === 'GET') {
+        return client.end(JSON.stringify(SYS_REDIRECTS));
+      } else if (method === 'POST' || method === 'PUT') {
+        query = qs.parse(query);
+        SYS_REDIRECTS[query.src] = query.dst;
+        return client.end(JSON.stringify(SYS_REDIRECTS));
+      } else if (method === 'DELETE') {
+        query = qs.parse(query);
+        delete SYS_REDIRECTS[query.src];
+        return client.end(JSON.stringify(SYS_REDIRECTS));
+      }
     }
   }
   client.write(`${httpVersion} 200 OK\r\n`);
