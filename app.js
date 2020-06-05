@@ -444,7 +444,7 @@ const handler = socket => {
                 }
               }
               let s = header.toString('utf-8', pos, p);
-              if (!url && /^(\w+)\s*(\S+)\s*HTTP\/(\S+)/i.test(s)) {
+              if (!url && /^(\w+)\s*(\S+)\s*(HTTP\/\S+)/i.test(s)) {
                 method = RegExp.$1;
                 url = RegExp.$2;
                 httpVersion = RegExp.$3;
@@ -469,7 +469,7 @@ const handler = socket => {
               pos = p + CRLF.length;
             } while (!(host && url));
             if (!url || !host) {
-              console.log('[%s] invalid request =>', cls.reqId, header.toString('utf-8'));
+              console.log('[%s] invalid https request =>', cls.reqId, header.length, header.toString('utf-8'));
               return cls.end();
             }
             let { pathname, query } = urlParse(url);
@@ -526,7 +526,7 @@ const handler = socket => {
               let s = tmp.toString('utf-8', pos, p);
               pos = p + CRLF.length;
               if (/^HTTP\/\S+\s+(\d+)/i.test(s) && /Connection established/i.test(s) && checkBodyStart(tmp, pos)) {
-                console.log('[%s] proxy status =>', socket.reqId, s);
+                console.log('[%s] https proxy status =>', socket.reqId, s);
                 tmp = tmp.slice(p + 4);
                 break;
               }
@@ -542,7 +542,80 @@ const handler = socket => {
         console.log('[%s] error =>', socket.reqId, err);
       });
     } else { // http
-      cachePipe(socket, null, port, chunk, null);
+      if (SYS_PROXY.host) {
+        let host, method, url, httpVersion;
+        let header = chunk;
+        let pos = 0;
+        do {
+          let p = header.indexOf(CRLF, pos);
+          if (p < 0) {
+            let chunk = socket.read();
+            if (chunk) {
+              header = Buffer.concat([header, chunk]);
+              continue;
+            } else {
+              break;
+            }
+          }
+          let s = header.toString('utf-8', pos, p);
+          if (!url && /^(\w+)\s*(\S+)\s*(HTTP\/\S+)/i.test(s)) {
+            method = RegExp.$1;
+            url = RegExp.$2;
+            httpVersion = RegExp.$3;
+          } else if (!host && /^(Host:\s*)(.*)(\s*)$/i.test(s)) {
+            host = RegExp.$2;
+            if (/^(.*):(.*)/.test(host)) {
+              host = RegExp.$1;
+              port = parseInt(RegExp.$2, 10) || port;
+            }
+          }
+          pos = p + CRLF.length;
+        } while (!(host && url));
+        if (!url || !host || !method || !httpVersion) {
+          console.log('[%s] invalid http request =>', socket.reqId, header.toString('utf-8'));
+          return socket.end();
+        }
+        if (net.isIP(host)) {
+          return cachePipe(socket, null, port, header, null);
+        }
+        const proxyOpts = {
+          host: SYS_PROXY.host,
+          port: SYS_PROXY.port
+        };
+        console.log('[%s] connect proxy => %s:%s', socket.reqId, SYS_PROXY.host, SYS_PROXY.port);
+        const proxy = net.connect(proxyOpts, () => {
+          console.log('[%s] proxy connected => %s:%s', socket.reqId, host, port);
+          proxy.write(`CONNECT ${host}:${port} HTTP/1.1\r\n\r\n`);
+        });
+
+        return proxy.once('readable', () => {
+          console.log('[%s] proxy readable => %s:%s', socket.reqId, host, port);
+          let tmp = EMPTY;
+          let pos = 0;
+          do {
+            let p = tmp.indexOf(CRLF, pos);
+            if (p < 0) {
+              let chunk = proxy.read();
+              if (chunk) {
+                tmp = Buffer.concat([tmp, chunk]);
+                continue;
+              } else {
+                break;
+              }
+            }
+            let s = tmp.toString('utf-8', pos, p);
+            pos = p + CRLF.length;
+            if (/^HTTP\/\S+\s+(\d+)/i.test(s) && /Connection established/i.test(s) && checkBodyStart(tmp, pos)) {
+              console.log('[%s] http proxy status =>', socket.reqId, s);
+              tmp = tmp.slice(p + 4);
+              break;
+            }
+          } while (pos < tmp.length);
+          cachePipe(socket, proxy, port, header, null);
+        });
+      } else {
+        cachePipe(socket, null, port, chunk, null);
+      }
     }
   });
 };
@@ -589,6 +662,7 @@ function checkGit (host, port, pathname, header, pos, client, query, method, htt
     });
     let chunks = [];
     const headers = {};
+    pos = 0;
     do {
       let p = header.indexOf(CRLF, pos);
       if (p < 0) {
@@ -600,7 +674,7 @@ function checkGit (host, port, pathname, header, pos, client, query, method, htt
           break;
         }
       }
-      if (p === pos) {
+      if (checkBodyStart(header, pos)) {
         pos = p + CRLF.length;
         break;
       }
@@ -629,8 +703,10 @@ function checkGit (host, port, pathname, header, pos, client, query, method, htt
       REQUEST_METHOD: method,
       CONTENT_TYPE: headers['content-type'] || '',
       CONTENT_LENGTH: body.length,
-      DOCUMENT_URI: pathname
+      DOCUMENT_URI: pathname,
+      REQUEST_URI: url
     }
+    console.log('[%s] git req => %s %j', client.reqId, pathname, headers);
     let repoHead = resolveFile(host, pathname.replace(/^\/([^/]+\/[^/]+).*$/, '$1'), 'HEAD');
     return statAsync(repoHead).then(stat => {
       if (!(stat && stat.size > 0)) {
@@ -638,11 +714,11 @@ function checkGit (host, port, pathname, header, pos, client, query, method, htt
         return gitClone(env.GIT_PROJECT_ROOT, pathname, baseUrl, client);
       }
     }).then(() => {
-      return pipeGit(pathname, env, client, body, httpVersion);
+      return pipeGit(pathname, env, client, body, httpVersion, client);
     }).then(() => {
       client.end();
     }).catch(err => {
-      console.error('[%s] git error =>', client.reqId, err);
+      console.error('[%s] git error =>', client.reqId, pathname, err);
       client.end();
     });
   }
@@ -706,7 +782,7 @@ function cachePipe (client, server, port, header, mapper) {
     chunk = client.read();
   }
   if (!url || !host) {
-    console.log('[%s] invalid request =>', client.reqId, header.toString('utf-8'));
+    console.log('[%s] cache pipe invalid request =>', client.reqId, header.toString('utf-8'));
     client.end();
     return;
   }
@@ -714,7 +790,7 @@ function cachePipe (client, server, port, header, mapper) {
     return manage(client, header, method, url, httpVersion);
   }
   let { pathname, query } = urlParse(url);
-  if (checkGit(host, port, pathname, header, pos, client, query, method, httpVersion, url)) {
+  if (checkGit(host, port, pathname, header, pos, client, query, method, httpVersion, url, userAgent)) {
     return;
   }
   const filename = resolveFile(host, port.toString(), pathname.replace(/^\/*/, ''), md5(Buffer.concat(chunks)));
@@ -734,7 +810,7 @@ function cachePipe (client, server, port, header, mapper) {
       if (location) {
         console.log('[%s] system redirect =>', client.reqId, location);
         connectLocation(location, httpVersion, userAgent, client).then(server => {
-          pipeServer(client, server, stream, method, host, url);
+          pipeServer(client, server, stream, method, host, url, httpVersion, userAgent);
         }).catch(err => {
           console.log('[%s] redirect error =>', client.reqId, err);
           client.end();
@@ -769,11 +845,20 @@ function cachePipe (client, server, port, header, mapper) {
         client.write = () => { };
       });
       if (server) {
+        server.on('error', err=>{
+          console.log('[%s] server error =>', client.reqId, err);
+        });
         client.on('data', buf => {
           req.write(buf);
           server.write(buf);
         });
-        pipeServer(client, server, stream, method, host, url, httpVersion, userAgent);
+        if (server.connecting) {
+          server.on('connect', () => {
+            pipeServer(client, server, stream, method, host, url, httpVersion, userAgent);
+          });
+        } else {
+          pipeServer(client, server, stream, method, host, url, httpVersion, userAgent);
+        }
       } else {
         client.on('data', buf => {
           req.write(buf);
@@ -804,7 +889,7 @@ function printProgress (id, progress) {
 }
 
 function pipeServer (client, server, stream, method, host, url, httpVersion, userAgent) {
-  console.log('[%s] pipe from server => %j %s:%s', client.reqId, server.localPort, server.remoteAddress, server.remotePort);
+  console.log('[%s][%s] pipe from server => %s:%s', client.reqId, server.localPort, server.remoteAddress, server.remotePort);
   server.reqId = server.localPort;
   let checked = false, location; // 检查HTTP状态
   server.on('error', (err) => {
@@ -835,11 +920,13 @@ function pipeServer (client, server, stream, method, host, url, httpVersion, use
   const checkReceived = buf => {
     if (contentStart) {
       receiveLength += buf.length;
-      printProgress(title, receiveLength + '/' + contentLength);
-      if (contentLength === receiveLength) {
-        process.stdout.write('\n');
-        console.log('[%s][%s] content complete =>', client.reqId, server.reqId, receiveLength);
-        server.end();
+      if (contentLength > 0) {
+        printProgress(title, receiveLength + '/' + contentLength);
+        if (contentLength === receiveLength) {
+          process.stdout.write('\n');
+          console.log('[%s][%s] content complete =>', client.reqId, server.reqId, receiveLength);
+          server.end();
+        }
       }
     } else {
       rsp = Buffer.concat([rsp, buf]);
@@ -853,6 +940,14 @@ function pipeServer (client, server, stream, method, host, url, httpVersion, use
           if (started > 0) {
             contentStart = true;
             receiveLength = rsp.length - rpos - started;
+            if (contentLength < 0) {
+              console.log('[%s] not content length =>', client.reqId, rsp.toString('utf-8', 0, rpos));
+            } else if (contentLength === receiveLength) {
+              console.log('[%s][%s] content complete =>', client.reqId, server.reqId, receiveLength);
+              server.end();
+            } else {
+              console.log('[%s] content length =>', client.reqId, contentLength, receiveLength);
+            }
             break;
           }
           if (/^\s*Content-Length:\s*(\d+)\s*$/i.test(s)) {
@@ -882,7 +977,7 @@ function pipeServer (client, server, stream, method, host, url, httpVersion, use
               server.end();
               console.log('[%s] redirect url =>', client.reqId, location);
               connectLocation(location, httpVersion, userAgent, client).then(server => {
-                pipeServer(client, server, stream, method, host, url);
+                pipeServer(client, server, stream, method, host, url, httpVersion, userAgent);
               }).catch(err => {
                 console.log('[%s] redirect error =>', client.reqId, err);
                 client.end();
@@ -927,7 +1022,20 @@ function connectLocation (location, httpVersion, agent, client) {
     options.port = SYS_PROXY.port;
     protocol = SYS_PROXY.protocol;
   }
-  return new Promise((resolve, reject) => {
+  return new Promise((_resolve, _reject) => {
+    let done = false;
+    const resolve = (server) => {
+      if (!done) {
+        done = true;
+        _resolve(server)
+      }
+    };
+    const reject = (err) => {
+      if (!done) {
+        done = true;
+        _reject(err)
+      }
+    };
     const writeReq = server => {
       const reqData = [
         `GET ${locUrl.path} ${httpVersion}`,
@@ -943,7 +1051,7 @@ function connectLocation (location, httpVersion, agent, client) {
       }
       server.once('readable', () => {
         console.log('[%s] location proxy readable.', client.reqId);
-        let tmp = EMPTY;
+        let tmp = server.read() || EMPTY;
         let pos = 0;
         do {
           let p = tmp.indexOf(CRLF, pos);
@@ -965,19 +1073,25 @@ function connectLocation (location, httpVersion, agent, client) {
           }
         } while (pos < tmp.length);
         if (tmp.length > 0) {
-          server.unshift(tmp);
+          console.log('[%s] location proxy error =>', client.reqId, tmp.toString('utf-8'));
         }
         if (/^https/.test(locUrl.protocol)) {
-          server = tls.connect({ socket: server, rejectUnauthorized: false }, () => {
-            server.write(Buffer.from(data, 'utf-8'));
-            resolve(server);
-          });
+          console.log('[%s] location attach proxy...', client.reqId)
+          const proxy = tls.connect({ socket: server, rejectUnauthorized: false }, () => {
+            console.log('[%s] location proxy attached.', client.reqId)
+            proxy.write(Buffer.from(data, 'utf-8'));
+            resolve(proxy);
+          }).once('error', reject);
         } else {
           server.write(Buffer.from(data, 'utf-8'));
           resolve(server);
         }
       });
-      server.write(`CONNECT ${locUrl.hostname}:${locUrl.port} ${httpVersion}\r\n\r\n`);
+      server.write(`CONNECT ${locUrl.hostname}:${locUrl.port} ${httpVersion}\r\n`);
+      server.write(`Host: ${locUrl.hostname}:${locUrl.port}\r\n`);
+      server.write(`User-Agent: ${agent}\r\n`);
+      server.write(`Proxy-Connection: close\r\n`);
+      server.write(`\r\n`);
     };
     if (/^https/.test(protocol)) {
       options.port = options.port || 443;
@@ -1031,7 +1145,7 @@ function gitClone (root, pathname, baseUrl, client) {
   });
 }
 
-function pipeGit (pathname, env, cls, body, httpVersion) {
+function pipeGit (pathname, env, cls, body, httpVersion, client) {
   const p = spawn(path.resolve(GIT_CORE, 'git-http-backend'), {
     env,
   });
